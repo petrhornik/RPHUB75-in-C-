@@ -1,7 +1,6 @@
 #include "Display.hpp"
 
 #include <cassert>
-#include <cmath>
 #include <cstring>
 #include <algorithm>
 
@@ -14,20 +13,6 @@ static inline void setPixelByIndex(uint8_t* view, int i, uint8_t r, uint8_t g, u
     view[i + 2] = b;
 }
 
-Display::Display(const DisplayConfig& config)
-    : _width(config.width)
-    , _height(config.height)
-    , _rotation(config.rotation)
-    , _brightness(0.5f)
-    , _csPin(config.spi.pin_cs)
-{
-    _frame.assign(static_cast<size_t>(_width) * _height * 3, 0);
-
-    setupSPI(config.spi);
-    buildSyncBuffer();
-    buildModesetBuffer();
-}
-
 Display::~Display() {
     if (_spi) {
         spi_bus_remove_device(_spi);
@@ -35,35 +20,77 @@ Display::~Display() {
     }
 }
 
-void Display::setPixel(float xf, float yf, Rgb color) {
-    int x = static_cast<int>(std::lround(xf));
-    int y = static_cast<int>(std::lround(yf));
+void Display::begin(const DisplayConfig& config) {
+    // WIDTH/HEIGHT (raw, unrotated) and _width/_height (rotation-aware) are
+    // inherited from Adafruit_GFX. setRotation() takes care of computing
+    // _width/_height from WIDTH/HEIGHT for us.
+    WIDTH = config.width;
+    HEIGHT = config.height;
+    setRotation(static_cast<uint8_t>(config.rotation));
 
-    if (x < 0 || y < 0 || x >= _width || y >= _height) return; // added: bounds check
+    _csPin = config.spi.pin_cs;
 
-    if (_rotation == 1) {
-        int nx = y;
-        int ny = _height - 1 - x;
-        x = nx;
-        y = ny;
-    } else if (_rotation == -1) {
-        int nx = _width - 1 - y;
-        int ny = x;
-        x = nx;
-        y = ny;
+    _frame.assign(static_cast<size_t>(WIDTH) * HEIGHT * 3, 0);
+
+    setupSPI(config.spi);
+    buildSyncBuffer();
+    buildModesetBuffer();
+}
+
+void Display::writePixelRaw(int x, int y, Rgb color888) {
+    // Bounds are checked in rotation-aware space (_width/_height), same as
+    // every other Adafruit_GFX-based display driver.
+    if (x < 0 || x >= _width || y < 0 || y >= _height) return;
+
+    int rx = x, ry = y;
+    switch (getRotation()) {
+        case 1: { int t = rx; rx = WIDTH - 1 - ry; ry = t; break; }
+        case 2: rx = WIDTH - 1 - rx; ry = HEIGHT - 1 - ry; break;
+        case 3: { int t = rx; rx = ry; ry = HEIGHT - 1 - t; break; }
+        default: break; // 0: no transform
     }
 
-    // Fixed: this used to use `_height` as the row stride (a straight
-    // port of the original TS), which only happens to work on square
-    // panels. For width != height it scrambles/overlaps rows, which is
-    // exactly the "torn" image you were seeing.
-    int i = x + _width * y;
+    int i = rx + WIDTH * ry; // stride is always the RAW (unrotated) width
 
-    uint8_t r = (color & 0xff0000) >> 16;
-    uint8_t g = (color & 0x00ff00) >> 8;
-    uint8_t b = color & 0x0000ff;
-
+    uint8_t r = (color888 & 0xff0000) >> 16;
+    uint8_t g = (color888 & 0x00ff00) >> 8;
+    uint8_t b = color888 & 0x0000ff;
     setPixelByIndex(_frame.data(), i, r, g, b);
+}
+
+void Display::setPixel(int x, int y, Rgb color) {
+    writePixelRaw(x, y, color);
+}
+
+void Display::drawPixel(int16_t x, int16_t y, uint16_t color565) {
+    writePixelRaw(x, y, rgb565to888(color565));
+}
+
+void Display::drawText(int x, int y, const char* text, Rgb color, uint8_t size) {
+    setTextColor(rgb888to565(color));
+    setTextSize(size);
+    setCursor(x, y);
+    print(text);
+}
+
+void Display::drawLine(int x0, int y0, int x1, int y1, Rgb color) {
+    Adafruit_GFX::drawLine(x0, y0, x1, y1, rgb888to565(color));
+}
+
+void Display::drawRect(int x, int y, int w, int h, Rgb color) {
+    Adafruit_GFX::drawRect(x, y, w, h, rgb888to565(color));
+}
+
+void Display::fillRect(int x, int y, int w, int h, Rgb color) {
+    Adafruit_GFX::fillRect(x, y, w, h, rgb888to565(color));
+}
+
+void Display::drawCircle(int x, int y, int r, Rgb color) {
+    Adafruit_GFX::drawCircle(x, y, r, rgb888to565(color));
+}
+
+void Display::fillCircle(int x, int y, int r, Rgb color) {
+    Adafruit_GFX::fillCircle(x, y, r, rgb888to565(color));
 }
 
 void Display::clear() {
@@ -74,30 +101,21 @@ void Display::fill(Rgb color) {
     uint8_t r = (color & 0xff0000) >> 16;
     uint8_t g = (color & 0x00ff00) >> 8;
     uint8_t b = color & 0x0000ff;
-
     for (size_t i = 0; i < _frame.size() / 3; i++)
         setPixelByIndex(_frame.data(), i, r, g, b);
 }
 
 void Display::drawImage(int x0, int y0, int w, int h, const uint8_t* rgb888) {
     for (int row = 0; row < h; row++) {
-        int y = y0 + row;
-        if (y < 0 || y >= _height) continue;
-
         for (int col = 0; col < w; col++) {
-            int x = x0 + col;
-            if (x < 0 || x >= _width) continue;
-
             const uint8_t* px = rgb888 + (static_cast<size_t>(row) * w + col) * 3;
             Rgb color = (static_cast<Rgb>(px[0]) << 16) | (static_cast<Rgb>(px[1]) << 8) | px[2];
-            setPixel(static_cast<float>(x), static_cast<float>(y), color);
+            writePixelRaw(x0 + col, y0 + row, color);
         }
     }
 }
 
 void Display::show() {
-    // Sync + modeset + frame concatenated into one continuous CS-low burst,
-    // see the notes in the header. CS is driven manually in spiTransfer().
     _txBuffer.resize(sizeof(_sync) + sizeof(_modeset) + _frame.size());
     uint8_t* p = _txBuffer.data();
     std::memcpy(p, _sync, sizeof(_sync));
@@ -110,9 +128,28 @@ void Display::show() {
 }
 
 void Display::setBrightness(float value) {
-    assert(value >= 0.0f && value <= 1.0f); // TS threw TypeError here
+    assert(value >= 0.0f && value <= 1.0f);
     _brightness = value;
     buildModesetBuffer();
+}
+
+uint16_t Display::rgb888to565(Rgb color) {
+    uint8_t r = (color >> 16) & 0xFF;
+    uint8_t g = (color >> 8) & 0xFF;
+    uint8_t b = color & 0xFF;
+    return (static_cast<uint16_t>(r & 0xF8) << 8)
+         | (static_cast<uint16_t>(g & 0xFC) << 3)
+         | (b >> 3);
+}
+
+Rgb Display::rgb565to888(uint16_t color) {
+    uint8_t r5 = (color >> 11) & 0x1F;
+    uint8_t g6 = (color >> 5) & 0x3F;
+    uint8_t b5 = color & 0x1F;
+    uint8_t r8 = (r5 * 255 + 15) / 31;
+    uint8_t g8 = (g6 * 255 + 31) / 63;
+    uint8_t b8 = (b5 * 255 + 15) / 31;
+    return (static_cast<Rgb>(r8) << 16) | (static_cast<Rgb>(g8) << 8) | b8;
 }
 
 void Display::setupSPI(const SPIConfig& spi) {
@@ -154,14 +191,12 @@ void Display::buildSyncBuffer() {
 }
 
 void Display::buildModesetBuffer() {
-    assert(_width < (1 << 16));
-
     _modeset[0] = 0xfb;
     _modeset[1] = 0x00;
     _modeset[2] = 0x09;
     _modeset[3] = static_cast<uint8_t>(255.0f * _brightness);
 
-    uint16_t w = static_cast<uint16_t>(_width);
+    uint16_t w = static_cast<uint16_t>(WIDTH);
     _modeset[4] = w & 0xff;
     _modeset[5] = (w >> 8) & 0xff;
 
