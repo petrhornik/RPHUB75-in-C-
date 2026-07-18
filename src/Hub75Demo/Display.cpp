@@ -39,6 +39,8 @@ void Display::setPixel(float xf, float yf, Rgb color) {
     int x = static_cast<int>(std::lround(xf));
     int y = static_cast<int>(std::lround(yf));
 
+    if (x < 0 || y < 0 || x >= _width || y >= _height) return; // added: bounds check
+
     if (_rotation == 1) {
         int nx = y;
         int ny = _height - 1 - x;
@@ -51,10 +53,11 @@ void Display::setPixel(float xf, float yf, Rgb color) {
         y = ny;
     }
 
-    // Faithful port of the original TS: the stride is `height`, not `width`.
-    // Kept as-is -- double check this matches your panel's memory layout,
-    // especially if width != height.
-    int i = x + _height * y;
+    // Fixed: this used to use `_height` as the row stride (a straight
+    // port of the original TS), which only happens to work on square
+    // panels. For width != height it scrambles/overlaps rows, which is
+    // exactly the "torn" image you were seeing.
+    int i = x + _width * y;
 
     uint8_t r = (color & 0xff0000) >> 16;
     uint8_t g = (color & 0x00ff00) >> 8;
@@ -76,16 +79,25 @@ void Display::fill(Rgb color) {
         setPixelByIndex(_frame.data(), i, r, g, b);
 }
 
+void Display::drawImage(int x0, int y0, int w, int h, const uint8_t* rgb888) {
+    for (int row = 0; row < h; row++) {
+        int y = y0 + row;
+        if (y < 0 || y >= _height) continue;
+
+        for (int col = 0; col < w; col++) {
+            int x = x0 + col;
+            if (x < 0 || x >= _width) continue;
+
+            const uint8_t* px = rgb888 + (static_cast<size_t>(row) * w + col) * 3;
+            Rgb color = (static_cast<Rgb>(px[0]) << 16) | (static_cast<Rgb>(px[1]) << 8) | px[2];
+            setPixel(static_cast<float>(x), static_cast<float>(y), color);
+        }
+    }
+}
+
 void Display::show() {
-    // The TS version does three chained SPI2.transfer(buf, cs, 0, true)
-    // calls. The exact meaning of the trailing `true` isn't known from this
-    // snippet alone -- the most likely reading is "keep CS asserted", so
-    // sync + modeset + frame form one continuous burst. We reproduce that
-    // by concatenating everything and driving CS manually in spiTransfer().
-    //
-    // If your bridge chip actually expects THREE separate CS pulses
-    // instead, replace the block below with three separate
-    // spiTransfer() calls (see note at the bottom of this file).
+    // Sync + modeset + frame concatenated into one continuous CS-low burst,
+    // see the notes in the header. CS is driven manually in spiTransfer().
     _txBuffer.resize(sizeof(_sync) + sizeof(_modeset) + _frame.size());
     uint8_t* p = _txBuffer.data();
     std::memcpy(p, _sync, sizeof(_sync));
@@ -108,7 +120,7 @@ void Display::setupSPI(const SPIConfig& spi) {
     csCfg.pin_bit_mask = 1ULL << spi.pin_cs;
     csCfg.mode = GPIO_MODE_OUTPUT;
     ESP_ERROR_CHECK(gpio_config(&csCfg));
-    gpio_set_level(_csPin, 1); // idle high
+    gpio_set_level(static_cast<gpio_num_t>(_csPin), 1); // idle high
 
     spi_bus_config_t buscfg = {};
     buscfg.mosi_io_num   = spi.pin_d0;
@@ -122,18 +134,15 @@ void Display::setupSPI(const SPIConfig& spi) {
 
     spi_device_interface_config_t devcfg = {};
     devcfg.clock_speed_hz = spi.baud;
-    devcfg.mode = 0;              // SPI mode 0, matches `mode: 0` in the TS setup()
-    devcfg.spics_io_num = -1;     // CS is driven manually, see spiTransfer()
+    devcfg.mode = 0;
+    devcfg.spics_io_num = -1; // driven manually, see spiTransfer()
     devcfg.queue_size = 4;
-    devcfg.flags = SPI_DEVICE_HALFDUPLEX | SPI_DEVICE_BIT_LSBFIRST; // matches `order: "lsb"`
+    devcfg.flags = SPI_DEVICE_HALFDUPLEX | SPI_DEVICE_BIT_LSBFIRST;
 
     ESP_ERROR_CHECK(spi_bus_add_device(SPI2_HOST, &devcfg, &_spi));
 }
 
 void Display::buildSyncBuffer() {
-    // Same 16 magic words as the TS version. Uint16Array on a little-endian
-    // platform (ESP32/ESP32-S3) stores each value low-byte-first, so we
-    // pack it the same way here.
     static constexpr uint16_t words[16] = {
         0xac92, 0x3bca, 0x41bf, 0x393d, 0xa74a, 0xae01, 0x155d, 0xfb70,
         0xf681, 0x2f6d, 0x4931, 0x0fa3, 0x77bf, 0xd756, 0x26f9, 0x4eb6,
@@ -145,15 +154,13 @@ void Display::buildSyncBuffer() {
 }
 
 void Display::buildModesetBuffer() {
-    assert(_width < (1 << 16)); // mirrors the RangeError in the TS version
+    assert(_width < (1 << 16));
 
-    // DataView.setUint16(0, 0xfb00) with no `littleEndian` arg is big-endian:
     _modeset[0] = 0xfb;
     _modeset[1] = 0x00;
     _modeset[2] = 0x09;
-    _modeset[3] = static_cast<uint8_t>(255.0f * _brightness); // Math.floor equivalent
+    _modeset[3] = static_cast<uint8_t>(255.0f * _brightness);
 
-    // DataView.setUint16(4, width, true) is explicitly little-endian:
     uint16_t w = static_cast<uint16_t>(_width);
     _modeset[4] = w & 0xff;
     _modeset[5] = (w >> 8) & 0xff;
@@ -163,20 +170,20 @@ void Display::buildModesetBuffer() {
 }
 
 void Display::spiTransfer(const uint8_t* data, size_t len) {
-    gpio_set_level(_csPin, 0);
+    gpio_set_level(static_cast<gpio_num_t>(_csPin), 0);
 
     size_t offset = 0;
     while (offset < len) {
         size_t chunk = std::min(len - offset, kMaxChunk);
 
         spi_transaction_t t = {};
-        t.flags = SPI_TRANS_MODE_QIO; // send over all 4 data lines
-        t.length = chunk * 8;         // in bits
+        t.flags = SPI_TRANS_MODE_QIO;
+        t.length = chunk * 8;
         t.tx_buffer = data + offset;
 
         ESP_ERROR_CHECK(spi_device_transmit(_spi, &t));
         offset += chunk;
     }
 
-    gpio_set_level(_csPin, 1);
+    gpio_set_level(static_cast<gpio_num_t>(_csPin), 1);
 }

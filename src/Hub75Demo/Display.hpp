@@ -11,12 +11,12 @@
 using Rgb = uint32_t;
 
 struct SPIConfig {
-    gpio_num_t pin_ck;
-    gpio_num_t pin_cs;
-    gpio_num_t pin_d0;
-    gpio_num_t pin_d1;
-    gpio_num_t pin_d2;
-    gpio_num_t pin_d3;
+    int pin_ck;
+    int pin_cs;
+    int pin_d0;
+    int pin_d1;
+    int pin_d2;
+    int pin_d3;
     int baud;
 };
 
@@ -29,7 +29,9 @@ struct DisplayConfig {
 
 /**
  * Holds a framebuffer and talks to a HUB75 bridge over quad SPI.
- * Direct C++ port of the Jaculus `Display` class for ESP-IDF / ESP32-S3.
+ * Direct C++ port of the Jaculus `Display` class for ESP-IDF / ESP32-S3,
+ * extended with raw pixel access and simple image drawing so it can back
+ * a text/graphics layer (see HubGfx.hpp).
  */
 class Display {
 public:
@@ -48,6 +50,11 @@ public:
     /// Fills the whole framebuffer with a solid color.
     void fill(Rgb color);
 
+    /// Draws an RGB888 image (row-major, top-down, 3 bytes/pixel) at (x, y).
+    /// Out-of-bounds pixels are clipped. Goes through setPixel(), so it
+    /// respects the current `rotation`.
+    void drawImage(int x, int y, int w, int h, const uint8_t* rgb888);
+
     /// Sends the framebuffer to the display over SPI.
     void show();
 
@@ -55,7 +62,12 @@ public:
     int width() const { return _width; }
     int height() const { return _height; }
 
-    const std::vector<uint8_t>& frame() const { return _frame; }
+    /// Direct access to the framebuffer for advanced use (scrolling, custom
+    /// blending, etc). Layout is RGB888, pixel index = (x + width * y) * 3.
+    /// This is the buffer BEFORE any rotation (rotation is only applied
+    /// inside setPixel()/drawImage()).
+    uint8_t* rawPixels() { return _frame.data(); }
+    size_t rawPixelsSize() const { return _frame.size(); }
 
     float brightness() const { return _brightness; }
     void setBrightness(float value);
@@ -76,7 +88,7 @@ private:
     uint8_t _modeset[8];
     std::vector<uint8_t> _txBuffer;   // scratch buffer used by show()
 
-    gpio_num_t _csPin;
+    int _csPin;
     spi_device_handle_t _spi = nullptr;
 
     void setupSPI(const SPIConfig& spi);
